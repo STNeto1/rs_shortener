@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use aws_sdk_dynamodb::model::AttributeValue;
-use aws_sdk_dynamodb::output::GetItemOutput;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -1,64 +1,116 @@
-use anyhow::{anyhow, bail, Error, Result};
+use std::net::SocketAddr;
+use std::sync::Arc;
+
 use aws_sdk_dynamodb::Client;
-use aws_sdk_dynamodb::model::AttributeValue;
-use aws_sdk_dynamodb::output::QueryOutput;
+use axum::extract::{Path, State};
+use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use serde::Deserialize;
+use serde_json::json;
 
 use crate::url::Url;
 
+mod dynamo;
 mod url;
 
+struct AppState {
+    client: Client,
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() {
     let config = aws_config::load_from_env().await;
     let client = Client::new(&config);
 
-    let basic_url = Url {
-        url: String::from("https://github.com/stneto1"),
-        short_url: String::from("another_short_url"),
-    };
+    let app_state = Arc::new(AppState { client });
 
-    //store_item(&basic_url, &client).await?;
-    let item = query_item(&basic_url.short_url, &client).await?;
-    println!("{:?}", item);
+    let app = Router::new()
+        .route("/search/:short_url", get(handle_get))
+        .route("/create", post(handle_post))
+        .with_state(app_state);
 
-    return Ok(());
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    println!("listening on {}", addr);
+    axum::Server::bind(&addr)
+        .serve(app.into_make_service())
+        .await
+        .unwrap();
 }
 
-async fn query_item(short_url: &String, client: &Client) -> Result<Url, Error> {
-    if let Ok(item) = client
-        .get_item()
-        .table_name("Url_Shortener")
-        .key("short_url", AttributeValue::S(short_url.to_owned()))
-        .send()
-        .await {
-        if let Some(raw_url) = item.item() {
-            if let Some(url) = Url::from_raw_dynamo(&raw_url) {
-                return Ok(url);
-            }
+async fn handle_get(
+    State(state): State<Arc<AppState>>,
+    Path(short_url): Path<String>,
+) -> impl IntoResponse {
+    match dynamo::query_item(&short_url, &state.client).await {
+        Ok(data) => (
+            StatusCode::OK,
+            Json(json!({"url": data.url.to_owned(), "short_url": data.short_url.to_owned()})),
+        ),
+        Err(_e) => (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "message": "error getting url"})),
+        ),
+    }
 
-            bail!("some error parsing");
-        } else {
-            bail!("some error");
+    // return Err(AppError(anyhow!("some error")));
+
+    // return Ok(Json(url));
+}
+
+#[derive(Debug, Deserialize)]
+struct CreatePost {
+    url: String,
+    short_url: Option<String>,
+}
+
+async fn handle_post(
+    State(state): State<Arc<AppState>>,
+    Json(payload): Json<CreatePost>,
+) -> Result<(), AppError> {
+    if payload.short_url.is_some() {
+        if let Ok(_) = dynamo::query_item(
+            &payload.short_url.clone().unwrap().to_owned(),
+            &state.client,
+        )
+        .await
+        {
+            return Err(AppError(anyhow::anyhow!("short url already in use")));
         }
     }
-    bail!("failed to get item");
-}
 
-async fn store_item(payload: &Url, client: &Client) -> Result<(), Error> {
-    client
-        .put_item()
-        .table_name("Url_Shortener")
-        .item(
-            "short_url",
-            aws_sdk_dynamodb::model::AttributeValue::S(String::from(payload.short_url.as_str())),
-        )
-        .item(
-            "url",
-            aws_sdk_dynamodb::model::AttributeValue::S(String::from(payload.url.as_str())),
-        )
-        .send()
-        .await
-        .map_err(|e| anyhow!("{}", e))?;
+    let url = Url {
+        url: payload.url,
+        short_url: payload.short_url.unwrap_or(String::from("some generator")),
+    };
+
+    dynamo::store_item(&url, &state.client).await?;
 
     return Ok(());
+}
+
+// Make our own error that wraps `anyhow::Error`.
+struct AppError(anyhow::Error);
+
+// Tell axum how to convert `AppError` into a response.
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Something went wrong: {}", self.0),
+        )
+            .into_response()
+    }
+}
+
+// This enables using `?` on functions that return `Result<_, anyhow::Error>` to turn them into
+// `Result<_, AppError>`. That way you don't need to do that manually.
+impl<E> From<E> for AppError
+where
+    E: Into<anyhow::Error>,
+{
+    fn from(err: E) -> Self {
+        Self(err.into())
+    }
 }
